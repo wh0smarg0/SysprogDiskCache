@@ -135,6 +135,153 @@ def test_write_wait():
     assert not cache.has_dirty_buffers()
     print("\nTEST PASSED: WRITE WAIT")
 
+def test_interrupt_during_execution(stage, test_number):
+    """
+    Перевіряє, що IRQ перериває виконання процесу,
+    не знищуючи залишок поточної операції.
+    """
+
+    print("\n" + "=" * 70)
+    print(f"{test_number}: IRQ під час {stage}")
+    print("=" * 70)
+
+    disk = HardDisk()
+    cache = LFUCache(total_buffers=CACHE_BUFFERS)
+    scheduler = IOScheduler(algorithm="FIFO")
+    kernel = Kernel()
+
+    process = Process("test_cpu", [('r', 100)])
+
+    if stage == "SYSCALL":
+        process.syscall_time = 10.0
+        process.stage = "SYSCALL"
+        process.remaining_time = 10.0
+
+    elif stage == "AFTER_READ":
+        process.stage = "AFTER_READ"
+        process.remaining_time = process.compute_time
+
+    else:
+        raise ValueError("Невідома стадія тестування")
+
+    class InterruptTestSimulator(Simulator):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.interrupt_snapshots = []
+
+        def handle_interrupt(self):
+            p = self.current_process
+
+            if p is not None:
+                before = {
+                    "stage": p.stage,
+                    "remaining_time": p.remaining_time,
+                    "remaining_quantum": p.remaining_quantum,
+                    "time": self.now
+                }
+            else:
+                before = None
+
+            super().handle_interrupt()
+
+            if before is not None:
+                self.interrupt_snapshots.append({
+                    "before": before,
+                    "after_stage": p.stage,
+                    "after_remaining_time": p.remaining_time,
+                    "after_remaining_quantum": p.remaining_quantum,
+                    "after_time": self.now
+                })
+
+    sim = InterruptTestSimulator(
+        [process],
+        disk,
+        cache,
+        scheduler,
+        kernel
+    )
+
+    # Незалежна дискова операція, яка завершиться
+    # під час виконання тестованого процесу.
+    scheduler.add_request(
+        IORequest("SYS", 900, is_write=False)
+    )
+
+    sim.dispatch_disk()
+
+    initial_execution_time = process.remaining_time
+
+    assert 0 < sim.disk_due < initial_execution_time, (
+        "IRQ не потрапляє всередину тестованої стадії."
+    )
+
+    sim.run()
+
+    snapshots = [
+        s for s in sim.interrupt_snapshots
+        if (
+            s["before"]["stage"] == stage
+            and s["before"]["remaining_time"] > 1e-9
+        )
+    ]
+
+    assert snapshots, (
+        f"Не зафіксовано IRQ під час {stage}."
+    )
+
+    snapshot = snapshots[0]
+    before = snapshot["before"]
+
+    assert snapshot["after_stage"] == stage, (
+        "IRQ змінив стадію перерваного процесу."
+    )
+
+    assert abs(
+        snapshot["after_remaining_time"]
+        - before["remaining_time"]
+    ) < 1e-9, (
+        "IRQ помилково зменшив залишок виконання."
+    )
+
+    assert abs(
+        snapshot["after_time"]
+        - before["time"]
+        - kernel.interrupt_handler_time
+    ) < 1e-9, (
+        "Некоректно враховано тривалість IRQ."
+    )
+
+    assert abs(
+        snapshot["after_remaining_quantum"]
+        - (
+            before["remaining_quantum"]
+            - kernel.interrupt_handler_time
+        )
+    ) < 1e-9, (
+        "Некоректно списано час IRQ із кванта."
+    )
+
+    assert process.state == "DONE", (
+        "Процес не завершив виконання після IRQ."
+    )
+
+    print(f"\nСтадія: {stage}")
+    print(f"Момент IRQ: {before['time']:.3f} мс")
+    print(
+        "Залишок виконання до IRQ: "
+        f"{before['remaining_time']:.3f} мс"
+    )
+    print(
+        "Залишок виконання після IRQ: "
+        f"{snapshot['after_remaining_time']:.3f} мс"
+    )
+    print(
+        "Тривалість обробки IRQ: "
+        f"{kernel.interrupt_handler_time:.3f} мс"
+    )
+
+    print(f"\nTEST PASSED: IRQ DURING {stage}")
+
 
 def print_and_export_summary():
     if not summary_results:
@@ -158,3 +305,13 @@ if __name__ == "__main__":
     run_all_scenarios()
     print_and_export_summary()
     test_write_wait()
+
+    test_interrupt_during_execution(
+        "SYSCALL",
+        15
+    )
+
+    test_interrupt_during_execution(
+        "AFTER_READ",
+        16
+    )

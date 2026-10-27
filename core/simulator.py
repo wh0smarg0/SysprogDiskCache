@@ -1,4 +1,3 @@
-
 from scheduling.io_scheduler import IORequest
 from utils.logger import Logger
 
@@ -238,7 +237,7 @@ class Simulator:
             # 4. Перевірка кванта процесора
             if (
                 p.remaining_quantum <= 0
-                and p.stage != "LOOKUP"
+                #and p.stage != "LOOKUP"
             ):
                 Logger.log_system(
                     self.now,
@@ -284,11 +283,12 @@ class Simulator:
                         f"завантаження сектора {sector}."
                     )
 
-                    self.pending_reads[sector].append(p)
+                    if p not in self.pending_reads[sector]:
+                        self.pending_reads[sector].append(p)
 
-                    buffer = self.find_buffer(sector)
-                    if buffer is not None:
-                        buffer.pins += 1
+                        buffer = self.find_buffer(sector)
+                        if buffer is not None:
+                            buffer.pins += 1
 
                     p.state = "BLOCKED"
                     p.blocked_for_sector = sector
@@ -445,6 +445,9 @@ class Simulator:
                 p.remaining_time -= dt
                 p.remaining_quantum -= dt
 
+                if p.stage == "SYSCALL":
+                    self.kernel.system_time += dt
+
             if p.remaining_time <= 0:
                 if p.stage == "BEFORE_WRITE":
                     p.stage = "SYSCALL"
@@ -498,6 +501,26 @@ class Simulator:
     def handle_interrupt(self):
         req = self.active_io
 
+        interrupted_process = self.current_process
+
+        remaining_before_irq = (
+            interrupted_process.remaining_time
+            if interrupted_process is not None
+            else None
+        )
+
+        if interrupted_process is not None:
+            Logger.log_event(
+                self.now,
+                interrupted_process.process_id,
+                "CPU INTERRUPTED",
+                f"IRQ перервав стадію {interrupted_process.stage}. "
+                f"Залишок виконання: "
+                f"{interrupted_process.remaining_time:.3f} мс. "
+                f"Залишок кванта: "
+                f"{interrupted_process.remaining_quantum:.3f} мс."
+            )
+
         Logger.log_event(
             self.now,
             "SYS",
@@ -506,12 +529,20 @@ class Simulator:
             f"(сектор {req.sector_number})."
         )
 
-        self.now += self.kernel.interrupt_handler_time
+        irq_time = self.kernel.interrupt_handler_time
+
+        self.now += irq_time
+        self.kernel.system_time += irq_time
+
+        if interrupted_process is not None:
+            assert abs(
+                interrupted_process.remaining_time - remaining_before_irq
+            ) < 1e-9, (
+                "Помилка: IRQ змінив залишок виконання процесу."
+            )
 
         if self.current_process is not None:
-            self.current_process.remaining_quantum -= (
-                self.kernel.interrupt_handler_time
-            )
+            self.current_process.remaining_quantum -= irq_time
 
         self.active_io = None
 
@@ -612,5 +643,17 @@ class Simulator:
         )
 
         self.wake_buffer_waiters()
+
+        if interrupted_process is not None:
+            Logger.log_event(
+                self.now,
+                interrupted_process.process_id,
+                "CPU RESUME",
+                f"Після IRQ: стадія {interrupted_process.stage}. "
+                f"Залишок виконання: "
+                f"{interrupted_process.remaining_time:.3f} мс. "
+                f"Залишок кванта: "
+                f"{interrupted_process.remaining_quantum:.3f} мс."
+            )
 
         self.dispatch_disk()
